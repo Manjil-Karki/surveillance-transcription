@@ -122,18 +122,58 @@ def load_clips_to_array(X_paths: list, desc: str = "Loading",
 
 # ── 4. Dataset splits ─────────────────────────────────────────────────────────
 
-def make_splits(X_paths: list, y: np.ndarray) -> dict:
-    X_tr, X_tmp, y_tr, y_tmp = train_test_split(
-        X_paths, y, test_size=0.30, stratify=y, random_state=SEED
-    )
-    X_val, X_te, y_val, y_te = train_test_split(
-        X_tmp, y_tmp, test_size=0.50, stratify=y_tmp, random_state=SEED
-    )
-    return {"train": (X_tr, y_tr), "val": (X_val, y_val), "test": (X_te, y_te)}
+def make_video_splits(video_dict_train: dict, video_dict_test: dict,
+                      val_ratio: float = 0.15):
+    """
+    Video-level split — zero inter-partition video overlap.
 
+    Train + val: Train folder videos split by video ID (val_ratio held out).
+    Test:        Test folder videos (entirely separate source videos).
 
-def get_normal_paths(video_dict: dict, stride: int = TRAIN_STRIDE) -> list:
-    return build_clips(video_dict.get("Normal", {}), stride, max_frames=MAX_FRAMES)
+    Returns:
+        splits dict: {"train": (paths, y), "val": (paths, y), "test": (paths, y)}
+        normal_train_vids: Normal video groups assigned to train (for X_normal.npy)
+    """
+    train_paths, y_train = [], []
+    val_paths,   y_val   = [], []
+    normal_train_vids    = {}
+
+    for label, video_groups in video_dict_train.items():
+        cls_idx  = CLASS_TO_IDX[label]
+        vid_ids  = sorted(video_groups.keys())
+        random.shuffle(vid_ids)
+
+        n_val        = max(1, round(len(vid_ids) * val_ratio))
+        val_vids     = {v: video_groups[v] for v in vid_ids[:n_val]}
+        train_vids   = {v: video_groups[v] for v in vid_ids[n_val:]}
+
+        if label == "Normal":
+            normal_train_vids = train_vids
+
+        tr = build_clips(train_vids, TRAIN_STRIDE, MAX_FRAMES)
+        va = build_clips(val_vids,   TRAIN_STRIDE, MAX_FRAMES)
+
+        train_paths.extend(tr); y_train.extend([cls_idx] * len(tr))
+        val_paths.extend(va);   y_val.extend([cls_idx] * len(va))
+
+        print(f"  {label:<12} train={len(tr):>4} clips ({len(vid_ids)-n_val} vids)  "
+              f"val={len(va):>4} clips ({n_val} vids)")
+
+    # Test set: UCF-Crime Test folder — videos never seen during training
+    test_paths, y_test = [], []
+    print("\nTest (separate Test folder):")
+    for label, video_groups in video_dict_test.items():
+        cls_idx = CLASS_TO_IDX[label]
+        clips   = build_clips(video_groups, TEST_STRIDE, MAX_FRAMES)
+        test_paths.extend(clips); y_test.extend([cls_idx] * len(clips))
+        print(f"  {label:<12} test={len(clips):>4} clips")
+
+    splits = {
+        "train": (train_paths, np.array(y_train, dtype=np.int32)),
+        "val":   (val_paths,   np.array(y_val,   dtype=np.int32)),
+        "test":  (test_paths,  np.array(y_test,  dtype=np.int32)),
+    }
+    return splits, normal_train_vids
 
 
 # ── 5. PyTorch Dataset ────────────────────────────────────────────────────────
@@ -145,17 +185,20 @@ class ClipDataset(Dataset):
     per item in __getitem__ so no full-array copy is made at init.
     """
 
-    def __init__(self, X: np.ndarray, y: np.ndarray = None):
-        self.X = X   # (N, T, H, W, C) numpy — no copy
-        self.y = torch.from_numpy(y).long() if y is not None else None
+    def __init__(self, X: np.ndarray, y: np.ndarray = None, training: bool = False):
+        self.X        = X   # (N, T, H, W, C) numpy — no copy
+        self.y        = torch.from_numpy(y).long() if y is not None else None
+        self.training = training   # enables augmentation
 
     def __len__(self) -> int:
         return len(self.X)
 
     def __getitem__(self, idx):
-        # (T, H, W, C) -> (T, C, H, W) for one clip — 384 KB, negligible cost
+        clip = self.X[idx]                      # (T, H, W, C)
+        if self.training and random.random() < 0.5:
+            clip = clip[:, :, ::-1, :]          # random horizontal flip
         x = torch.from_numpy(
-            np.ascontiguousarray(self.X[idx].transpose(0, 3, 1, 2))
+            np.ascontiguousarray(clip.transpose(0, 3, 1, 2))
         ).float()
         if self.y is not None:
             return x, self.y[idx]
@@ -163,8 +206,9 @@ class ClipDataset(Dataset):
 
 
 def make_loader(X: np.ndarray, y: np.ndarray = None,
-                shuffle: bool = True, batch_size: int = BATCH_SIZE) -> DataLoader:
-    return DataLoader(ClipDataset(X, y), batch_size=batch_size,
+                shuffle: bool = True, batch_size: int = BATCH_SIZE,
+                training: bool = False) -> DataLoader:
+    return DataLoader(ClipDataset(X, y, training=training), batch_size=batch_size,
                       shuffle=shuffle, num_workers=0, pin_memory=True)
 
 

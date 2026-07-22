@@ -53,13 +53,14 @@ MAX_FRAMES   = 24000    # cap per class to balance dataset (~3 000 clips)
 LATENT_DIM   = 256      # CNN encoder output dimension per frame
 LSTM_UNITS   = 128
 FC_UNITS     = 64
-DROPOUT      = 0.3
+DROPOUT      = 0.5
 
 # ── Training ──────────────────────────────────────────────────────────────────
 PRETRAIN_EPOCHS  = 30
 JOINT_EPOCHS     = 30
 BATCH_SIZE       = 32
-LEARNING_RATE    = 1e-3
+LEARNING_RATE    = 1e-4     # reduced from 1e-3 to limit memorisation speed
+WEIGHT_DECAY     = 1e-4     # L2 regularisation
 LAMBDA           = 0.5      # weight of classification loss in joint loss
                             # tried: 0.1, 0.5, 1.0 (ablation)
 

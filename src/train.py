@@ -16,7 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from src.config import (
-    PRETRAIN_EPOCHS, JOINT_EPOCHS, BATCH_SIZE, LEARNING_RATE,
+    PRETRAIN_EPOCHS, JOINT_EPOCHS, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY,
     LAMBDA, SEED, MODELS_DIR, PLOTS_DIR
 )
 from src.dataset import make_loader
@@ -100,15 +100,19 @@ def joint_train(joint_model, X_train, y_train, X_val, y_val,
                 lam: float = LAMBDA,
                 device: torch.device = torch.device("cpu")) -> dict:
 
-    tr_loader = make_loader(X_train, y_train, shuffle=True)
-    va_loader = make_loader(X_val,   y_val,   shuffle=False)
+    tr_loader = make_loader(X_train, y_train, shuffle=True,  training=True)
+    va_loader = make_loader(X_val,   y_val,   shuffle=False, training=False)
 
     joint_model = joint_model.to(device)
 
-    # Only optimise parameters with requires_grad=True (encoder + lstm_head)
-    trainable   = [p for p in joint_model.parameters() if p.requires_grad]
-    optimizer   = torch.optim.Adam(trainable, lr=LEARNING_RATE)
-    scheduler   = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+    # Freeze encoder — keeps reconstruction features intact, prevents encoder overfitting.
+    # Only the LSTM head (206K params) trains; encoder (2.19M) stays fixed.
+    for p in joint_model.encoder.parameters():
+        p.requires_grad = False
+
+    trainable = [p for p in joint_model.lstm_head.parameters()]
+    optimizer = torch.optim.Adam(trainable, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
     mse_loss    = nn.MSELoss()
     ce_loss     = nn.CrossEntropyLoss()
 
@@ -134,6 +138,7 @@ def joint_train(joint_model, X_train, y_train, X_val, y_val,
             c = ce_loss(logits, labels)
             loss = r + lam * c
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
             optimizer.step()
             tr["loss"].append(loss.item())
             tr["recon"].append(r.item())
@@ -173,7 +178,7 @@ def joint_train(joint_model, X_train, y_train, X_val, y_val,
             torch.save(joint_model.state_dict(), MODELS_DIR / "joint_model_best.pth")
         else:
             no_improve += 1
-            if no_improve >= 7:
+            if no_improve >= 10:
                 print(f"[INFO] Early stopping at epoch {epoch + 1}")
                 break
 
