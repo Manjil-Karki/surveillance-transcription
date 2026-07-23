@@ -1,6 +1,6 @@
 """
 Grad-CAM — PyTorch implementation using forward/backward hooks.
-Targets the last Conv2d in the encoder CNN w.r.t. the LSTM classification score.
+Targets the last Conv2d in the encoder CNN w.r.t. the classification score.
 """
 
 import numpy as np
@@ -30,15 +30,15 @@ class GradCAM:
     Hook-based Grad-CAM on the last Conv2d of the encoder.
 
     Usage:
-        gcam = GradCAM(encoder, lstm_head)
+        gcam = GradCAM(encoder, temporal_head)
         heatmap, pred_cls, conf = gcam.compute(clip_np, class_idx, frame_idx)
         gcam.remove()
     """
 
-    def __init__(self, encoder, lstm_head, device=_DEVICE):
-        self.encoder   = encoder.to(device).eval()
-        self.lstm_head = lstm_head.to(device).eval()
-        self.device    = device
+    def __init__(self, encoder, head, device=_DEVICE):
+        self.encoder = encoder.to(device).eval()
+        self.head    = head.to(device).eval()
+        self.device  = device
         self._acts     = None
         self._grads    = None
 
@@ -75,10 +75,10 @@ class GradCAM:
         ).float().unsqueeze(0).to(self.device)
 
         self.encoder.zero_grad()
-        self.lstm_head.zero_grad()
+        self.head.zero_grad()
 
-        embeddings = self.encoder(clip_t)         # (1, T, LATENT_DIM)
-        logits     = self.lstm_head(embeddings)   # (1, NUM_CLASSES)
+        embeddings = self.encoder(clip_t)     # (1, T, LATENT_DIM)
+        logits     = self.head(embeddings)    # (1, NUM_CLASSES)
 
         if class_idx is None:
             class_idx = int(logits.argmax(dim=1).item())
@@ -114,10 +114,10 @@ class GradCAM:
 
 # ── Functional wrappers (match original API) ──────────────────────────────────
 
-def compute_gradcam(encoder, lstm_head, clip: np.ndarray,
+def compute_gradcam(encoder, head, clip: np.ndarray,
                     class_idx: int = None, frame_idx: int = None,
                     device=_DEVICE) -> tuple:
-    gcam = GradCAM(encoder, lstm_head, device=device)
+    gcam = GradCAM(encoder, head, device=device)
     result = gcam.compute(clip, class_idx, frame_idx)
     gcam.remove()
     return result
@@ -131,14 +131,14 @@ def overlay_heatmap(frame: np.ndarray, heatmap: np.ndarray,
 
 # ── Batch visualisation ───────────────────────────────────────────────────────
 
-def visualize_gradcam_batch(encoder, lstm_head,
+def visualize_gradcam_batch(encoder, head,
                              X: np.ndarray, y: np.ndarray,
                              n_per_class: int = 2,
                              save_path: Path = PLOTS_DIR / "gradcam_batch.png",
                              device=_DEVICE):
     from src.config import ANOMALY_CLASSES, CLASS_TO_IDX
 
-    gcam   = GradCAM(encoder, lstm_head, device=device)
+    gcam   = GradCAM(encoder, head, device=device)
     n_rows = len(ANOMALY_CLASSES) * n_per_class
     fig, axes = plt.subplots(n_rows, 3, figsize=(9, n_rows * 2.2))
     if n_rows == 1:
@@ -155,7 +155,7 @@ def visualize_gradcam_batch(encoder, lstm_head,
         for s_idx in samples:
             clip     = X[s_idx]
             mid      = CLIP_LEN // 2
-            frame    = clip[mid]
+            frame    = clip[mid, :, :, :3]   # show RGB channels only
             heatmap, pred_cls, conf = gcam.compute(clip, class_idx=cls_idx, frame_idx=mid)
             overlay  = overlay_heatmap(frame, heatmap)
 

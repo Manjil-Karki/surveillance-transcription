@@ -1,9 +1,13 @@
 """
-CNN-LSTM Multi-Task Autoencoder — PyTorch implementation.
+CNN Multi-Task Autoencoder — PyTorch implementation.
 
+Input:  (B, T, IN_CHANNELS=6, H, W)  — RGB + frame-difference channels
 Shared CNN encoder feeds:
-  - Frozen decoder  (Task 1: Anomaly Detection via reconstruction MSE)
-  - LSTM head       (Task 2: Event classification -> Timeline)
+  - Frozen decoder  (Task 1: Anomaly Detection via reconstruction MSE on RGB)
+  - LSTMHead        (Task 2: Event classification -> Timeline)
+
+LSTMHead is the default temporal head because it preserves ordering information
+that is critical for timeline generation. TemporalPoolHead is kept for ablation.
 """
 
 import torch
@@ -11,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.config import (
-    CLIP_LEN, FRAME_H, FRAME_W, CHANNELS,
+    CLIP_LEN, FRAME_H, FRAME_W, CHANNELS, IN_CHANNELS,
     LATENT_DIM, LSTM_UNITS, FC_UNITS, DROPOUT, NUM_CLASSES
 )
 
@@ -30,7 +34,7 @@ class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.cnn = nn.Sequential(
-            nn.Conv2d(CHANNELS, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),   # 64->32
+            nn.Conv2d(IN_CHANNELS, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),  # 64->32
             nn.Conv2d(32, 64,  3, padding=1), nn.ReLU(), nn.MaxPool2d(2),        # 32->16
             nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),        # 16->8
         )
@@ -97,6 +101,27 @@ class LSTMHead(nn.Module):
         return self.fc(h.squeeze(0))
 
 
+# ── Temporal-Pool Classification Head ────────────────────────────────────────
+
+class TemporalPoolHead(nn.Module):
+    """
+    Temporal average pooling + FC classifier.
+    ~16K params vs LSTMHead's ~206K — far less likely to overfit.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(LATENT_DIM, FC_UNITS),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT),
+            nn.Linear(FC_UNITS, NUM_CLASSES),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(x.mean(dim=1))   # (B, T, LATENT_DIM) -> (B, NUM_CLASSES)
+
+
 # ── Autoencoder (pre-training) ────────────────────────────────────────────────
 
 class Autoencoder(nn.Module):
@@ -115,20 +140,26 @@ class Autoencoder(nn.Module):
 
 class JointModel(nn.Module):
     """
-    Shared encoder -> frozen decoder (Task 1) + LSTM head (Task 2).
-    Returns (reconstruction, classification_logits).
+    Shared encoder -> frozen decoder (Task 1) + temporal head (Task 2).
+
+    Input clips: (B, T, IN_CHANNELS=6, H, W)
+    Reconstruction: decoder outputs (B, T, CHANNELS=3, H, W) — RGB only.
+    Classification: LSTMHead logits (B, NUM_CLASSES) — preserves temporal ordering.
+
+    LSTMHead is used by default. Pass temporal_head=TemporalPoolHead() for ablation.
     """
 
-    def __init__(self, encoder: Encoder, decoder: Decoder, lstm_head: LSTMHead):
+    def __init__(self, encoder: Encoder, decoder: Decoder,
+                 temporal_head: nn.Module = None):
         super().__init__()
-        self.encoder   = encoder
-        self.decoder   = decoder
-        self.lstm_head = lstm_head
+        self.encoder       = encoder
+        self.decoder       = decoder
+        self.temporal_head = temporal_head if temporal_head is not None else LSTMHead()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         embeddings     = self.encoder(x)
         reconstruction = self.decoder(embeddings)
-        classification = self.lstm_head(embeddings)
+        classification = self.temporal_head(embeddings)
         return reconstruction, classification
 
 
@@ -151,6 +182,26 @@ class SingleFrameCNN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+# ── Single-frame wrapper (Ablation) ──────────────────────────────────────────
+
+class SingleFrameWrapper(nn.Module):
+    """
+    Wraps SingleFrameCNN so it accepts clip tensors (B, T, C, H, W).
+    Extracts the middle frame (RGB only) and returns (None, logits) tuple
+    matching JointModel's output interface for use with evaluate_classifier.
+    """
+
+    def __init__(self, model: SingleFrameCNN):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor) -> tuple:
+        mid    = x.shape[1] // 2
+        frame  = x[:, mid, :3, :, :]   # (B, 3, H, W) — RGB channels only
+        logits = self.model(frame)
+        return None, logits
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────

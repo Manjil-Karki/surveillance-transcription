@@ -112,21 +112,23 @@ def plot_frame_counts(save: bool = True) -> tuple[dict, dict]:
 def plot_selected_classes(train_counts: dict, save: bool = True):
     folder_names = list(CLASS_MAP.keys())
     raw    = [train_counts.get(f, 0) for f in folder_names]
-    capped = [min(r, MAX_FRAMES) for r in raw]
+    capped = [r if MAX_FRAMES is None else min(r, MAX_FRAMES) for r in raw]
     labels = [CLASS_MAP[f] for f in folder_names]
     x = np.arange(len(labels))
     w = 0.38
 
     cls_clrs = [CLASS_COLORS[l] for l in labels]
 
+    cap_label = f"After cap ({MAX_FRAMES:,})" if MAX_FRAMES else "All frames (no cap)"
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.bar(x - w/2, raw,    width=w, color=cls_clrs, alpha=0.45, label="Raw", edgecolor="white")
-    ax.bar(x + w/2, capped, width=w, color=cls_clrs, label=f"After cap ({MAX_FRAMES:,})")
-    ax.axhline(MAX_FRAMES, color="red", ls="--", lw=1.2, label=f"Cap = {MAX_FRAMES:,}")
+    ax.bar(x + w/2, capped, width=w, color=cls_clrs, label=cap_label)
+    if MAX_FRAMES:
+        ax.axhline(MAX_FRAMES, color="red", ls="--", lw=1.2, label=f"Cap = {MAX_FRAMES:,}")
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_ylabel("Frame count")
-    ax.set_title("Selected 5 Classes: Raw vs Capped Frame Counts", fontweight="bold")
+    ax.set_title("Selected 5 Classes: Raw vs Full Frame Counts", fontweight="bold")
     ax.legend()
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
     ax.grid(axis="y", alpha=0.3)
@@ -225,7 +227,7 @@ def plot_clip_estimates(train_counts: dict, save: bool = True):
 
     clips = []
     for f in folder_names:
-        frames = min(train_counts.get(f, 0), MAX_FRAMES)
+        frames = train_counts.get(f, 0) if MAX_FRAMES is None else min(train_counts.get(f, 0), MAX_FRAMES)
         n_clips = max(0, (frames - CLIP_LEN) // TRAIN_STRIDE + 1)
         clips.append(n_clips)
 

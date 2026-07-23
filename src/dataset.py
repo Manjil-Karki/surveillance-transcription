@@ -18,9 +18,10 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from src.config import (
-    CLASS_MAP, CLASS_TO_IDX, CLIP_LEN, TRAIN_STRIDE,
+    CLASS_MAP, CLASS_TO_IDX, NUM_CLASSES, CLIP_LEN, TRAIN_STRIDE,
     TEST_STRIDE, MAX_FRAMES, FRAME_H, FRAME_W, CHANNELS,
-    SEED, BATCH_SIZE, RESULTS_DIR
+    SEED, BATCH_SIZE, RESULTS_DIR,
+    AUG_BRIGHTNESS, AUG_CONTRAST, AUG_NOISE_STD,
 )
 
 random.seed(SEED)
@@ -100,14 +101,130 @@ def build_all_clips(video_dict: dict, stride: int, cap: bool = True) -> tuple:
 
 # ── 3. Frame loading ──────────────────────────────────────────────────────────
 
-def load_clip(clip_paths: list) -> np.ndarray:
-    """Load CLIP_LEN frames -> (T, H, W, C) float32 [0,1]."""
-    frames = []
-    for p in clip_paths:
-        img = Image.open(p).convert("RGB").resize((FRAME_W, FRAME_H), Image.BILINEAR)
-        frames.append(np.array(img, dtype=np.float32) / 255.0)
-    return np.stack(frames, axis=0)   # (T, H, W, C)
+def _load_clip_rgb(clip_paths: list) -> np.ndarray:
+    """Load frames as float32 RGB -> (T, H, W, 3) in [0, 1]. Uses cv2 for speed."""
+    try:
+        import cv2
+        frames = []
+        for p in clip_paths:
+            img = cv2.imread(str(p))                                    # BGR uint8
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if img.shape[:2] != (FRAME_H, FRAME_W):
+                img = cv2.resize(img, (FRAME_W, FRAME_H), interpolation=cv2.INTER_LINEAR)
+            frames.append(img.astype(np.float32) / 255.0)
+    except (ImportError, Exception):
+        frames = []
+        for p in clip_paths:
+            img = Image.open(p).convert("RGB").resize((FRAME_W, FRAME_H), Image.BILINEAR)
+            frames.append(np.array(img, dtype=np.float32) / 255.0)
+    return np.stack(frames, axis=0)   # (T, H, W, 3)
 
+
+def _rgb_to_6ch(rgb: np.ndarray) -> np.ndarray:
+    """(T, H, W, 3) RGB -> (T, H, W, 6) = RGB + frame-difference."""
+    diffs = np.diff(rgb, axis=0)
+    diffs = np.concatenate([np.zeros_like(rgb[:1]), diffs], axis=0)
+    return np.concatenate([rgb, diffs], axis=-1)
+
+
+def _augment_rgb(rgb: np.ndarray) -> np.ndarray:
+    """Apply random spatial + photometric augmentations to (T, H, W, 3) array."""
+    rgb = rgb.copy()
+
+    if random.random() < 0.5:                                      # horizontal flip
+        rgb = rgb[:, :, ::-1, :]
+
+    if random.random() < 0.5:                                      # brightness jitter
+        delta = random.uniform(-AUG_BRIGHTNESS, AUG_BRIGHTNESS)
+        rgb = np.clip(rgb + delta, 0.0, 1.0)
+
+    if random.random() < 0.5:                                      # contrast jitter
+        factor = random.uniform(1.0 - AUG_CONTRAST, 1.0 + AUG_CONTRAST)
+        mean = rgb.mean()
+        rgb = np.clip(mean + factor * (rgb - mean), 0.0, 1.0)
+
+    if random.random() < 0.3:                                      # Gaussian noise
+        noise = np.random.normal(0.0, AUG_NOISE_STD, rgb.shape).astype(np.float32)
+        rgb = np.clip(rgb + noise, 0.0, 1.0)
+
+    return rgb
+
+
+def load_clip(clip_paths: list) -> np.ndarray:
+    """Load CLIP_LEN frames -> (T, H, W, 6): RGB + frame-difference channels."""
+    return _rgb_to_6ch(_load_clip_rgb(clip_paths))
+
+
+
+# ── 3b. Pre-packing (one .npy per clip for fast loading) ─────────────────────
+
+def pack_clips_to_disk(X_paths: list, y: np.ndarray, out_dir: Path,
+                       desc: str = "Packing") -> list:
+    """
+    Save each clip as a single uint8 RGB .npy file (16 PNGs -> 1 file).
+    Returns list of .npy paths.
+    ~40x faster to load than per-frame PNG reads.
+    Disk cost: ~0.19 MB per clip (uint8 RGB only; diff computed at load time).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npy_paths = []
+    for i, (clip_paths, label) in enumerate(
+            tqdm(zip(X_paths, y), desc=desc, total=len(X_paths))):
+        rgb_u8 = (_load_clip_rgb(clip_paths) * 255).astype(np.uint8)
+        npy_path = out_dir / f"clip_{i:06d}_lbl{int(label)}.npy"
+        np.save(npy_path, rgb_u8)
+        npy_paths.append(npy_path)
+    return npy_paths
+
+
+class PackedClipDataset(Dataset):
+    """
+    Fast dataset backed by pre-packed per-clip .npy files.
+    Each file stores (T, H, W, 3) uint8 RGB — diff channels computed at load time.
+    Typical load time: ~0.2ms/clip vs ~8ms for PNG lazy loading.
+    """
+
+    def __init__(self, npy_paths: list, y: np.ndarray = None, training: bool = False):
+        self.samples  = npy_paths
+        self.y        = torch.from_numpy(y).long() if y is not None else None
+        self.training = training
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        rgb = np.load(self.samples[idx]).astype(np.float32) / 255.0  # (T, H, W, 3)
+        if self.training:
+            rgb = _augment_rgb(rgb)
+        clip = _rgb_to_6ch(rgb)
+        x    = torch.from_numpy(
+            np.ascontiguousarray(clip.transpose(0, 3, 1, 2))
+        ).float()
+        if self.y is not None:
+            return x, self.y[idx]
+        return x
+
+
+def make_packed_loader(npy_paths: list, y: np.ndarray = None,
+                       shuffle: bool = True,
+                       batch_size: int = BATCH_SIZE,
+                       training: bool = False,
+                       num_workers: int = 4) -> DataLoader:
+    """DataLoader for pre-packed .npy clips. Fast and WSL2-safe."""
+    ds = PackedClipDataset(npy_paths, y, training=training)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
+    )
+
+
+# ── 3c. Legacy bulk loader ────────────────────────────────────────────────────
 
 def load_clips_to_array(X_paths: list, desc: str = "Loading",
                         num_workers: int = 4) -> np.ndarray:
@@ -176,7 +293,7 @@ def make_video_splits(video_dict_train: dict, video_dict_test: dict,
     return splits, normal_train_vids
 
 
-# ── 5. PyTorch Dataset ────────────────────────────────────────────────────────
+# ── 5. PyTorch Datasets ───────────────────────────────────────────────────────
 
 class ClipDataset(Dataset):
     """
@@ -188,7 +305,7 @@ class ClipDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray = None, training: bool = False):
         self.X        = X   # (N, T, H, W, C) numpy — no copy
         self.y        = torch.from_numpy(y).long() if y is not None else None
-        self.training = training   # enables augmentation
+        self.training = training
 
     def __len__(self) -> int:
         return len(self.X)
@@ -210,6 +327,68 @@ def make_loader(X: np.ndarray, y: np.ndarray = None,
                 training: bool = False) -> DataLoader:
     return DataLoader(ClipDataset(X, y, training=training), batch_size=batch_size,
                       shuffle=shuffle, num_workers=0, pin_memory=True)
+
+
+class ClipPathDataset(Dataset):
+    """
+    Memory-efficient lazy-loading Dataset.
+    Stores only clip frame paths; loads and processes each clip in __getitem__.
+    RAM usage = one batch only, not the entire dataset.
+
+    X_paths: list of clip_paths (each clip_paths is a list of Path objects).
+    """
+
+    def __init__(self, X_paths: list, y: np.ndarray = None, training: bool = False):
+        self.samples  = X_paths
+        self.y        = torch.from_numpy(y).long() if y is not None else None
+        self.training = training
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        rgb  = _load_clip_rgb(self.samples[idx])  # (T, H, W, 3)
+        if self.training:
+            rgb = _augment_rgb(rgb)
+        clip = _rgb_to_6ch(rgb)                   # (T, H, W, 6)
+        x    = torch.from_numpy(
+            np.ascontiguousarray(clip.transpose(0, 3, 1, 2))
+        ).float()
+        if self.y is not None:
+            return x, self.y[idx]
+        return x
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    seed = SEED + worker_id
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def make_path_loader(X_paths: list, y: np.ndarray = None,
+                     shuffle: bool = True,
+                     batch_size: int = BATCH_SIZE,
+                     training: bool = False,
+                     num_workers: int = 4) -> DataLoader:
+    """DataLoader backed by lazy per-clip file loading. Low RAM footprint."""
+    ds = ClipPathDataset(X_paths, y, training=training)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,   # avoid Jupyter/WSL2 worker deadlocks
+        worker_init_fn=_worker_init_fn if num_workers > 0 else None,
+    )
+
+
+def compute_class_weights(y: np.ndarray) -> np.ndarray:
+    """Balanced class weights for CrossEntropyLoss (inverse class frequency)."""
+    from sklearn.utils.class_weight import compute_class_weight
+    classes = np.arange(NUM_CLASSES)
+    weights = compute_class_weight("balanced", classes=classes, y=y)
+    return weights.astype(np.float32)
 
 
 # ── 6. Save / load preprocessed arrays ───────────────────────────────────────
@@ -235,10 +414,10 @@ def save_splits(splits: dict, normal_paths: list, out_dir: Path = RESULTS_DIR):
 
 
 def load_npy_split(split_name: str, out_dir: Path = RESULTS_DIR) -> tuple:
-    X = np.load(out_dir / f"X_{split_name}.npy")
+    X = np.load(out_dir / f"X_{split_name}.npy", mmap_mode="r")
     y = np.load(out_dir / f"y_{split_name}.npy")
     return X, y
 
 
 def load_normal_npy(out_dir: Path = RESULTS_DIR) -> np.ndarray:
-    return np.load(out_dir / "X_normal.npy")
+    return np.load(out_dir / "X_normal.npy", mmap_mode="r")

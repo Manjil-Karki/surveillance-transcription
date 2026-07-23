@@ -21,7 +21,7 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 from src.config import (
-    CLASSES, IDX_TO_CLASS, PLOTS_DIR, RESULTS_DIR, CLIP_LEN,
+    CLASSES, IDX_TO_CLASS, CLASS_TO_IDX, PLOTS_DIR, RESULTS_DIR, CLIP_LEN,
     FRAME_H, FRAME_W, CHANNELS
 )
 
@@ -38,6 +38,27 @@ def _np_to_tensor(X: np.ndarray, device) -> torch.Tensor:
     return torch.from_numpy(X.transpose(0, 1, 4, 2, 3)).float().to(device)
 
 
+def _iter_batches(X, batch_size: int = 32, device=_DEVICE):
+    """Yield (B, T, C, H, W) tensors from numpy array, packed .npy paths, or PNG path list."""
+    if isinstance(X, np.ndarray):
+        for i in range(0, len(X), batch_size):
+            yield _np_to_tensor(X[i:i + batch_size], device)
+    elif X and str(X[0]).endswith(".npy"):
+        from src.dataset import PackedClipDataset
+        from torch.utils.data import DataLoader
+        loader = DataLoader(PackedClipDataset(X), batch_size=batch_size,
+                            shuffle=False, num_workers=0)
+        for clips in loader:
+            yield clips.to(device)
+    else:
+        from src.dataset import ClipPathDataset
+        from torch.utils.data import DataLoader
+        loader = DataLoader(ClipPathDataset(X), batch_size=batch_size,
+                            shuffle=False, num_workers=0)
+        for clips in loader:
+            yield clips.to(device)
+
+
 def _tensor_to_np(t: torch.Tensor) -> np.ndarray:
     """(N, T, C, H, W) tensor -> (N, T, H, W, C) numpy."""
     return t.cpu().numpy().transpose(0, 1, 3, 4, 2)
@@ -45,18 +66,17 @@ def _tensor_to_np(t: torch.Tensor) -> np.ndarray:
 
 # ── 1. Anomaly Scoring ────────────────────────────────────────────────────────
 
-def compute_reconstruction_errors(model, X: np.ndarray,
+def compute_reconstruction_errors(model, X,
                                    batch_size: int = 32,
                                    device=_DEVICE) -> np.ndarray:
-    """Per-clip mean MSE reconstruction error. Returns (N,) array."""
+    """Per-clip mean MSE reconstruction error. X may be numpy array or path list."""
     model.eval()
     errors = []
     with torch.no_grad():
-        for i in range(0, len(X), batch_size):
-            batch = _np_to_tensor(X[i: i + batch_size], device)
-            out = model(batch)
+        for batch in _iter_batches(X, batch_size, device):
+            out   = model(batch)
             recon = out[0] if isinstance(out, tuple) else out
-            mse = ((recon - batch) ** 2).mean(dim=(1, 2, 3, 4))
+            mse   = ((recon - batch[:, :, :3, :, :]) ** 2).mean(dim=(1, 2, 3, 4))
             errors.extend(mse.cpu().tolist())
     return np.array(errors)
 
@@ -110,15 +130,14 @@ def _print_threshold_table(results: dict):
 
 # ── 2. Classification Metrics ─────────────────────────────────────────────────
 
-def evaluate_classifier(joint_model, X_test: np.ndarray,
-                         y_test: np.ndarray, batch_size: int = 32,
-                         device=_DEVICE) -> tuple:
+def evaluate_classifier(joint_model, X_test, y_test: np.ndarray,
+                         batch_size: int = 32, device=_DEVICE) -> tuple:
+    """X_test may be numpy array or clip-path list."""
     joint_model.eval()
     preds = []
     with torch.no_grad():
-        for i in range(0, len(X_test), batch_size):
-            batch = _np_to_tensor(X_test[i: i + batch_size], device)
-            out   = joint_model(batch)
+        for batch in _iter_batches(X_test, batch_size, device):
+            out    = joint_model(batch)
             logits = out[1] if isinstance(out, tuple) else out
             preds.extend(logits.argmax(dim=1).cpu().tolist())
 
@@ -132,17 +151,96 @@ def evaluate_classifier(joint_model, X_test: np.ndarray,
 
 # ── 3. Latent Embeddings ──────────────────────────────────────────────────────
 
-def get_embeddings(encoder, X: np.ndarray, batch_size: int = 32,
+def get_embeddings(encoder, X, batch_size: int = 32,
                    device=_DEVICE) -> np.ndarray:
-    """Mean-over-time encoder embeddings for PCA/t-SNE. Returns (N, LATENT_DIM)."""
+    """Mean-over-time encoder embeddings for PCA/t-SNE. X: numpy or path list."""
     encoder.eval()
     embs = []
     with torch.no_grad():
-        for i in range(0, len(X), batch_size):
-            batch = _np_to_tensor(X[i: i + batch_size], device)
+        for batch in _iter_batches(X, batch_size, device):
             e = encoder(batch)            # (B, T, LATENT_DIM)
             embs.append(e.mean(dim=1).cpu().numpy())
     return np.concatenate(embs, axis=0)
+
+
+# ── 2b. Binary anomaly detection ──────────────────────────────────────────────
+
+def evaluate_binary(joint_model, X_test, y_test: np.ndarray,
+                    batch_size: int = 32, device=_DEVICE) -> tuple:
+    """
+    Binary anomaly detection: Normal (0) vs any Anomaly (1).
+    Returns (results_dict, p_anomaly_scores, binary_gt).
+    """
+    normal_idx = CLASS_TO_IDX["Normal"]
+    joint_model.eval()
+    all_probs = []
+    with torch.no_grad():
+        for batch in _iter_batches(X_test, batch_size, device):
+            out    = joint_model(batch)
+            logits = out[1] if isinstance(out, tuple) else out
+            probs  = torch.softmax(logits, dim=1).cpu().numpy()
+            all_probs.append(probs)
+
+    all_probs  = np.concatenate(all_probs, axis=0)          # (N, C)
+    p_anomaly  = 1.0 - all_probs[:, normal_idx]             # P(anomaly)
+    binary_pred = (p_anomaly > 0.5).astype(int)
+    binary_gt   = (y_test != normal_idx).astype(int)
+
+    auc = roc_auc_score(binary_gt, p_anomaly)
+    p, r, f, _ = precision_recall_fscore_support(
+        binary_gt, binary_pred, average="binary", zero_division=0)
+    acc = float((binary_pred == binary_gt).mean())
+
+    result = {"accuracy": acc, "precision": p, "recall": r, "f1": f, "auc": auc}
+    print("\nBinary Anomaly Detection  (Normal vs Anomaly)")
+    print(f"  Accuracy : {acc:.3f}  Precision: {p:.3f}  Recall: {r:.3f}  F1: {f:.3f}  AUC: {auc:.3f}")
+    _save_json(result, "binary_anomaly_report.json")
+    return result, p_anomaly, binary_gt
+
+
+# ── 2c. Fusion score ──────────────────────────────────────────────────────────
+
+def compute_fusion_score(recon_errors: np.ndarray,
+                          class_probs: np.ndarray,
+                          alpha: float = 0.5) -> np.ndarray:
+    """
+    Blend normalised reconstruction error and classifier anomaly probability.
+    alpha=1 -> recon only; alpha=0 -> classifier only; 0.5 -> equal blend.
+    class_probs: (N, NUM_CLASSES) softmax output from joint model.
+    Returns: (N,) fusion anomaly score in [0, 1].
+    """
+    norm_recon = (recon_errors - recon_errors.min()) / (recon_errors.ptp() + 1e-8)
+    p_anomaly  = 1.0 - class_probs[:, CLASS_TO_IDX["Normal"]]
+    return alpha * norm_recon + (1.0 - alpha) * p_anomaly
+
+
+# ── 2d. Ablation comparison ───────────────────────────────────────────────────
+
+def ablation_compare(models_dict: dict, X_test, y_test: np.ndarray,
+                      batch_size: int = 32, device=_DEVICE) -> dict:
+    """
+    Evaluate multiple models on the same test set and print a summary table.
+    models_dict: {name: model} — each model must output (recon, logits) or just logits.
+    """
+    results = {}
+    for name, model in models_dict.items():
+        print(f"\n{'='*45}\n{name}\n{'='*45}")
+        y_pred, report = evaluate_classifier(model, X_test, y_test, batch_size, device)
+        results[name] = {
+            "accuracy":  report.get("accuracy", 0.0),
+            "macro_f1":  report.get("macro avg", {}).get("f1-score", 0.0),
+        }
+
+    print("\n" + "="*55)
+    print("ABLATION SUMMARY")
+    print("="*55)
+    print(f"{'Model':<35} {'Acc':>7} {'Macro F1':>10}")
+    print("-"*55)
+    for name, r in results.items():
+        print(f"{name:<35} {r['accuracy']:>7.3f} {r['macro_f1']:>10.3f}")
+
+    _save_json(results, "ablation_results.json")
+    return results
 
 
 # ── 4. Plots ──────────────────────────────────────────────────────────────────
@@ -211,7 +309,7 @@ def plot_reconstruction_samples(model, X: np.ndarray, n: int = 4,
     fig, axes = plt.subplots(n, 2 * CLIP_LEN, figsize=(CLIP_LEN * 3, n * 2))
     for row in range(n):
         for col in range(CLIP_LEN):
-            axes[row][col].imshow(sample[row, col]); axes[row][col].axis("off")
+            axes[row][col].imshow(sample[row, col, :, :, :3]); axes[row][col].axis("off")
             if row == 0: axes[row][col].set_title(f"In {col+1}", fontsize=7)
             axes[row][CLIP_LEN + col].imshow(np.clip(recon_np[row, col], 0, 1))
             axes[row][CLIP_LEN + col].axis("off")
@@ -260,6 +358,20 @@ _CLASS_COLORS = {
     "Arson":    "#FF7043",
     "Burglary": "#AB47BC",
 }
+
+def plot_binary_roc(p_anomaly: np.ndarray, binary_gt: np.ndarray,
+                    save_path=PLOTS_DIR / "binary_roc.png"):
+    fpr, tpr, _ = roc_curve(binary_gt, p_anomaly)
+    auc = roc_auc_score(binary_gt, p_anomaly)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.plot(fpr, tpr, linewidth=2, label=f"AUC = {auc:.3f}")
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1)
+    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+    ax.set_title("Binary Anomaly Detection ROC", fontweight="bold")
+    ax.legend(); ax.grid(alpha=0.3)
+    plt.tight_layout(); fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig); print(f"[OK] Binary ROC saved: {save_path}")
+
 
 def plot_per_class_metrics(report, save_path=PLOTS_DIR / "per_class_metrics.png"):
     metrics = {cls: report[cls] for cls in CLASSES if cls in report}

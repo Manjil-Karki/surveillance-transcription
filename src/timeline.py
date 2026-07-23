@@ -80,7 +80,8 @@ def sliding_window_predict(joint_model, sequence_clips: np.ndarray,
                             device=_DEVICE) -> tuple:
     """
     Run the joint model over every clip.
-    Returns: pred_labels (N,), pred_probs (N, C), recon_errors (N,)
+    Returns: pred_labels (N,), pred_probs (N, C), recon_errors (N,).
+    pred_probs is needed for compute_fusion_score().
     """
     from src.evaluate import _np_to_tensor
 
@@ -97,7 +98,7 @@ def sliding_window_predict(joint_model, sequence_clips: np.ndarray,
             pred_labels.extend(probs.argmax(axis=1).tolist())
             pred_probs.extend(probs.tolist())
 
-            mse = ((recon - batch) ** 2).mean(dim=(1, 2, 3, 4)).cpu().numpy()
+            mse = ((recon - batch[:, :, :3, :, :]) ** 2).mean(dim=(1, 2, 3, 4)).cpu().numpy()
             recon_errors.extend(mse.tolist())
 
     return (np.array(pred_labels),
@@ -197,6 +198,37 @@ def plot_score_over_time(recon_errors, pred_labels, threshold,
     ax2.grid(alpha=0.3)
     plt.tight_layout(); fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig); print(f"[OK] Score-over-time saved: {save_path}")
+
+
+def plot_fusion_over_time(fusion_scores: np.ndarray, pred_labels: np.ndarray,
+                           threshold: float = 0.5,
+                           save_path=PLOTS_DIR / "fusion_score_over_time.png"):
+    """
+    Plot combined reconstruction + classification anomaly score over clip index.
+    fusion_scores: (N,) from evaluate.compute_fusion_score().
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 5), sharex=True)
+    t = np.arange(len(fusion_scores))
+
+    ax1.plot(t, fusion_scores, linewidth=0.8, color="#333333")
+    ax1.axhline(threshold, color="red", ls="--", lw=1.2,
+                label=f"Threshold ({threshold:.2f})")
+    ax1.fill_between(t, fusion_scores, threshold,
+                     where=fusion_scores > threshold, alpha=0.3, color="red")
+    ax1.set_ylabel("Fusion Anomaly Score")
+    ax1.set_title("Fusion Score Over Time (recon + classifier blend)", fontweight="bold")
+    ax1.set_ylim(0, 1); ax1.legend(fontsize=8); ax1.grid(alpha=0.3)
+
+    for i, cls in enumerate(CLASSES):
+        mask = pred_labels == i
+        ax2.scatter(t[mask], np.full(mask.sum(), i),
+                    s=4, color=CLASS_COLORS.get(cls, "#888888"), label=cls, alpha=0.8)
+    ax2.set_yticks(range(len(CLASSES))); ax2.set_yticklabels(CLASSES, fontsize=8)
+    ax2.set_xlabel("Clip Index")
+    ax2.set_title("Predicted Class Over Time", fontweight="bold")
+    ax2.grid(alpha=0.3)
+    plt.tight_layout(); fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig); print(f"[OK] Fusion score saved: {save_path}")
 
 
 def print_timeline(segments: list):

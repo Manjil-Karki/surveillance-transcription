@@ -2,6 +2,7 @@ docs/
 data/
 scripts/
 outputs/
+outputs_backup/
 __pycache__/
 *.pyc
 .venv/

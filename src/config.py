@@ -43,11 +43,17 @@ ANOMALY_CLASSES = [c for c in CLASSES if c != "Normal"]
 # ── Data ──────────────────────────────────────────────────────────────────────
 FRAME_H      = 64
 FRAME_W      = 64
-CHANNELS     = 3
-CLIP_LEN     = 8        # frames per clip
-TRAIN_STRIDE = 8        # non-overlapping clips for training
-TEST_STRIDE  = 4        # 50% overlap for test sliding window
-MAX_FRAMES   = 24000    # cap per class to balance dataset (~3 000 clips)
+CHANNELS     = 3        # output channels (reconstruction)
+IN_CHANNELS  = 6        # input channels: 3 RGB + 3 frame-difference (motion)
+CLIP_LEN     = 16       # frames per clip (16 captures full anomaly events)
+TRAIN_STRIDE = 16       # non-overlapping clips for training
+TEST_STRIDE  = 8        # 50% overlap for test sliding window
+MAX_FRAMES   = None     # no cap — use full dataset; class weights handle imbalance
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+AUG_BRIGHTNESS = 0.2    # brightness jitter range ±
+AUG_CONTRAST   = 0.2    # contrast jitter range ±
+AUG_NOISE_STD  = 0.02   # Gaussian noise std
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 LATENT_DIM   = 256      # CNN encoder output dimension per frame
@@ -58,7 +64,7 @@ DROPOUT      = 0.5
 # ── Training ──────────────────────────────────────────────────────────────────
 PRETRAIN_EPOCHS  = 30
 JOINT_EPOCHS     = 30
-BATCH_SIZE       = 32
+BATCH_SIZE       = 64       # 64 clips × 16 frames = 1024 frames/batch; safe for 8 GB VRAM
 LEARNING_RATE    = 1e-4     # reduced from 1e-3 to limit memorisation speed
 WEIGHT_DECAY     = 1e-4     # L2 regularisation
 LAMBDA           = 0.5      # weight of classification loss in joint loss

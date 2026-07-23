@@ -15,11 +15,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from sklearn.metrics import classification_report as sk_classification_report
+
 from src.config import (
     PRETRAIN_EPOCHS, JOINT_EPOCHS, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY,
-    LAMBDA, SEED, MODELS_DIR, PLOTS_DIR
+    LAMBDA, SEED, MODELS_DIR, PLOTS_DIR, CLASSES
 )
-from src.dataset import make_loader
+from src.dataset import make_loader, make_path_loader, make_packed_loader
 
 torch.manual_seed(SEED)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,14 +30,26 @@ PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Phase 1: Pre-train Autoencoder ───────────────────────────────────────────
 
-def pretrain_autoencoder(autoencoder, X_normal: np.ndarray,
+def pretrain_autoencoder(autoencoder, X_normal,
                           val_split: float = 0.15,
-                          device: torch.device = torch.device("cpu")) -> dict:
+                          device: torch.device = torch.device("cpu"),
+                          use_lazy: bool = False,
+                          use_packed: bool = False) -> dict:
+    """
+    X_normal: numpy array (N, T, H, W, C)  when use_lazy=False
+              list of clip-path lists       when use_lazy=True
+    """
     n_val = int(len(X_normal) * val_split)
     X_tr, X_va = X_normal[n_val:], X_normal[:n_val]
-
-    tr_loader = make_loader(X_tr, shuffle=True)
-    va_loader = make_loader(X_va, shuffle=False)
+    if use_packed:
+        tr_loader = make_packed_loader(X_tr, shuffle=True)
+        va_loader = make_packed_loader(X_va, shuffle=False)
+    elif use_lazy:
+        tr_loader = make_path_loader(X_tr, shuffle=True)
+        va_loader = make_path_loader(X_va, shuffle=False)
+    else:
+        tr_loader = make_loader(X_tr, shuffle=True)
+        va_loader = make_loader(X_va, shuffle=False)
 
     autoencoder = autoencoder.to(device)
     optimizer   = torch.optim.Adam(autoencoder.parameters(), lr=LEARNING_RATE)
@@ -53,7 +67,7 @@ def pretrain_autoencoder(autoencoder, X_normal: np.ndarray,
             batch = batch.to(device)
             optimizer.zero_grad()
             recon = autoencoder(batch)
-            loss  = criterion(recon, batch)
+            loss  = criterion(recon, batch[:, :, :3, :, :])   # target is RGB only
             loss.backward()
             optimizer.step()
             tr_losses.append(loss.item())
@@ -63,7 +77,7 @@ def pretrain_autoencoder(autoencoder, X_normal: np.ndarray,
         with torch.no_grad():
             for batch in va_loader:
                 batch = batch.to(device)
-                va_losses.append(criterion(autoencoder(batch), batch).item())
+                va_losses.append(criterion(autoencoder(batch), batch[:, :, :3, :, :]).item())
 
         tr_loss = float(np.mean(tr_losses))
         va_loss = float(np.mean(va_losses))
@@ -98,23 +112,40 @@ def pretrain_autoencoder(autoencoder, X_normal: np.ndarray,
 
 def joint_train(joint_model, X_train, y_train, X_val, y_val,
                 lam: float = LAMBDA,
-                device: torch.device = torch.device("cpu")) -> dict:
+                device: torch.device = torch.device("cpu"),
+                class_weights: np.ndarray = None,
+                use_lazy: bool = False,
+                use_packed: bool = False) -> dict:
+    """
+    Joint fine-tune: frozen encoder + LSTM head.
 
-    tr_loader = make_loader(X_train, y_train, shuffle=True,  training=True)
-    va_loader = make_loader(X_val,   y_val,   shuffle=False, training=False)
+    class_weights: (NUM_CLASSES,) float32 array from compute_class_weights().
+    use_lazy:      True  -> X_train/X_val are lists of clip-path lists (low RAM).
+                   False -> X_train/X_val are numpy arrays.
+    """
+    if use_packed:
+        tr_loader = make_packed_loader(X_train, y_train, shuffle=True,  training=True)
+        va_loader = make_packed_loader(X_val,   y_val,   shuffle=False, training=False)
+    elif use_lazy:
+        tr_loader = make_path_loader(X_train, y_train, shuffle=True,  training=True)
+        va_loader = make_path_loader(X_val,   y_val,   shuffle=False, training=False)
+    else:
+        tr_loader = make_loader(X_train, y_train, shuffle=True,  training=True)
+        va_loader = make_loader(X_val,   y_val,   shuffle=False, training=False)
 
     joint_model = joint_model.to(device)
 
-    # Freeze encoder — keeps reconstruction features intact, prevents encoder overfitting.
-    # Only the LSTM head (206K params) trains; encoder (2.19M) stays fixed.
+    # Freeze encoder — keeps reconstruction features intact, prevents overfitting.
     for p in joint_model.encoder.parameters():
         p.requires_grad = False
 
-    trainable = [p for p in joint_model.lstm_head.parameters()]
+    trainable = list(joint_model.temporal_head.parameters())
     optimizer = torch.optim.Adam(trainable, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-    mse_loss    = nn.MSELoss()
-    ce_loss     = nn.CrossEntropyLoss()
+    mse_loss  = nn.MSELoss()
+    weight_t  = (torch.tensor(class_weights, dtype=torch.float32).to(device)
+                 if class_weights is not None else None)
+    ce_loss   = nn.CrossEntropyLoss(weight=weight_t)
 
     best_val = float("inf")
     no_improve = 0
@@ -134,7 +165,7 @@ def joint_train(joint_model, X_train, y_train, X_val, y_val,
             clips, labels = clips.to(device), labels.to(device)
             optimizer.zero_grad()
             recon, logits = joint_model(clips)
-            r = mse_loss(recon, clips)
+            r = mse_loss(recon, clips[:, :, :3, :, :])   # decoder outputs RGB only
             c = ce_loss(logits, labels)
             loss = r + lam * c
             loss.backward()
@@ -153,7 +184,7 @@ def joint_train(joint_model, X_train, y_train, X_val, y_val,
             for clips, labels in va_loader:
                 clips, labels = clips.to(device), labels.to(device)
                 recon, logits = joint_model(clips)
-                r = mse_loss(recon, clips)
+                r = mse_loss(recon, clips[:, :, :3, :, :])
                 c = ce_loss(logits, labels)
                 va["loss"].append((r + lam * c).item())
                 va["recon"].append(r.item())
@@ -189,21 +220,40 @@ def joint_train(joint_model, X_train, y_train, X_val, y_val,
     joint_model.load_state_dict(torch.load(MODELS_DIR / "joint_model_best.pth",
                                             map_location=device))
     _save_history(history, "joint_history.json")
+
+    # Final classification report on validation set
+    joint_model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for clips, labels in va_loader:
+            clips = clips.to(device)
+            _, logits = joint_model(clips)
+            all_preds.extend(logits.argmax(1).cpu().tolist())
+            all_labels.extend(labels.tolist())
+    print("\nValidation classification report:")
+    print(sk_classification_report(all_labels, all_preds, target_names=CLASSES, zero_division=0))
+
     return history
 
 
 def joint_train_lambda_sweep(X_train, y_train, X_val, y_val,
                               lambdas=(0.1, 0.5, 1.0),
-                              device: torch.device = torch.device("cpu")) -> dict:
+                              device: torch.device = torch.device("cpu"),
+                              class_weights: np.ndarray = None,
+                              use_lazy: bool = False,
+                              use_packed: bool = False) -> dict:
     from src.model import Encoder, Decoder, LSTMHead, JointModel, freeze_decoder
     results = {}
     for lam in lambdas:
         print(f"\n{'='*50}\nLambda = {lam}\n{'='*50}")
-        enc  = Encoder(); dec = Decoder(); freeze_decoder(dec); lstm = LSTMHead()
-        model = JointModel(enc, dec, lstm)
+        enc = Encoder(); dec = Decoder(); freeze_decoder(dec); head = LSTMHead()
+        model = JointModel(enc, dec, head)
         enc.load_state_dict(torch.load(MODELS_DIR / "encoder_pretrained.pth", map_location=device))
         dec.load_state_dict(torch.load(MODELS_DIR / "decoder_pretrained.pth", map_location=device))
-        hist = joint_train(model, X_train, y_train, X_val, y_val, lam=lam, device=device)
+        hist = joint_train(model, X_train, y_train, X_val, y_val,
+                           lam=lam, device=device,
+                           class_weights=class_weights, use_lazy=use_lazy,
+                           use_packed=use_packed)
         results[lam] = {"val_loss": min(hist["val_loss"]), "val_acc": max(hist["val_acc"])}
         torch.save(model.state_dict(), MODELS_DIR / f"joint_model_lam{lam}.pth")
     print("\nLambda sweep results:")
