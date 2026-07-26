@@ -1,9 +1,40 @@
-docs/
+# Dataset (too large for git)
 data/
-scripts/
+
+# Trained model outputs and result directories
 outputs/
 outputs_backup/
+outputs_final/
+outputs_m09/
+outputs_m11/
+outputs_v2/
+new_run_2/
+
+# Archive of early-iteration notebooks (not for submission)
+_archive/
+
+# Python environment
+venv/
+.venv/
 __pycache__/
 *.pyc
-.venv/
-venv/
+
+# Windows metadata
+Zone.Identifier
+*.Zone.Identifier
+*:Zone.Identifier
+
+# Generated outputs inside notebooks folder
+notebooks/outputs_v2/
+notebooks/plots/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+scripts/
+docs/
+plots/
